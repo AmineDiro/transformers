@@ -1118,12 +1118,14 @@ class GroupedGemmParallel(TensorParallelLayer):
         if os.environ.get("TRANSFORMERS_SKIP_EP_DTENSOR_WRAP", "") == "1":
             return param
 
-        from . import is_deepspeed_zero3_enabled
-        if is_deepspeed_zero3_enabled():
-            # MoE markers: is_moe_param(p) → True. Routes the param through DS's MoE-aware
-            # broadcast / optimizer / ZeRO-3 paths (with the matching DS-side patch in
-            # _zero_init_param that uses expert_data_parallel_group instead of the full
-            # DP group for MoE params).
+        # Detect any active DeepSpeed config (Z1/Z2/Z3 — only Z1/Z2 have native MoE plumbing).
+        from .deepspeed import _hf_deepspeed_config_weak_ref
+        ds_active = _hf_deepspeed_config_weak_ref is not None and _hf_deepspeed_config_weak_ref() is not None
+        if ds_active:
+            # MoE markers consumed by DS's `is_moe_param(p)` (param.allreduce=False).
+            # In ZeRO-1/2: stage_1_and_2.py uses these to route grad reduce through
+            # `expert_dp_process_group` and put MoE params in a separate optim group.
+            # In ZeRO-3: stage3.py has no MoE plumbing — additional upstream work needed.
             param.allreduce = False
             param.group_name = f"ep_size_{self.device_mesh.size()}"
             return param
