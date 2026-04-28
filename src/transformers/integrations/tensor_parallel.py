@@ -1121,16 +1121,11 @@ class GroupedGemmParallel(TensorParallelLayer):
         from . import is_deepspeed_zero3_enabled
         if is_deepspeed_zero3_enabled():
             # MoE markers: is_moe_param(p) → True. Routes the param through DS's MoE-aware
-            # broadcast / optimizer paths.
+            # broadcast / optimizer / ZeRO-3 paths (with the matching DS-side patch in
+            # _zero_init_param that uses expert_data_parallel_group instead of the full
+            # DP group for MoE params).
             param.allreduce = False
             param.group_name = f"ep_size_{self.device_mesh.size()}"
-            # Also mark as already-ZeRO-managed so `is_zero_param(p)` returns True and
-            # `_convert_to_zero_parameters` skips this param entirely. Otherwise ZeRO-3's
-            # init broadcasts each param from global rank 0 across the FULL DP group
-            # (`_zero_init_param` doesn't check is_moe_param), which would clobber EP
-            # slices on the other-DP-replica ranks — same shape of bug PR #45662 fixed
-            # for FSDP, just via a different DS code path.
-            param.ds_id = id(param)
             return param
 
         dt = DTensor.from_local(param.data, self.device_mesh, [Shard(0)], run_check=False)
