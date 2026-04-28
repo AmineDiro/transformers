@@ -1100,16 +1100,30 @@ class GroupedGemmParallel(TensorParallelLayer):
 
     def post_shard_wrap(self, param: nn.Parameter) -> nn.Parameter:
         """
-        Wrap the EP-sharded local tensor as a DTensor on the TP/EP mesh. Without this, the
-        optimizer's foreach ops error with "mixed Tensor and DTensor" against the
-        FSDP-wrapped DTensor params on the rest of the model.
+        Final wrap for EP-sharded params. Two backends:
+
+        - **DS-Z3**: tag with `param.allreduce = False` + `param.group_name = f"ep_size_{N}"` so
+          DeepSpeed's MoE-aware path picks them up. `is_moe_param(p)` becomes True; ZeRO-3
+          partitions inside `expert_data_parallel_group` (DP-of-EP), `_broadcast_model`
+          broadcasts inside the same group, and the optimizer puts these in a separate
+          param group. Returned as plain `nn.Parameter` — DS expects this.
+
+        - **FSDP / default**: wrap the local shard as a DTensor on the EP mesh. Without
+          this, Adam's foreach ops error with "mixed Tensor and DTensor" against
+          FSDP-wrapped DTensor params on the rest of the model.
         """
         # Benchmark gate: TRANSFORMERS_SKIP_EP_DTENSOR_WRAP=1 leaves EP params as plain
-        # nn.Parameter. Used to bisect whether the wrap is the cause of issues; pre-fix,
-        # the wrap-less path "worked" (with broken EP weights) at 32.36% MFU.
+        # nn.Parameter (debug/bisect only).
         import os
         if os.environ.get("TRANSFORMERS_SKIP_EP_DTENSOR_WRAP", "") == "1":
             return param
+
+        from . import is_deepspeed_zero3_enabled
+        if is_deepspeed_zero3_enabled():
+            param.allreduce = False
+            param.group_name = f"ep_size_{self.device_mesh.size()}"
+            return param
+
         dt = DTensor.from_local(param.data, self.device_mesh, [Shard(0)], run_check=False)
         return nn.Parameter(dt, requires_grad=param.requires_grad)
 

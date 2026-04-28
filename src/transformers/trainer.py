@@ -827,6 +827,19 @@ class Trainer:
         self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
         self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
 
+        # DS-Z3 + EP: create the named expert process groups DS expects before deepspeed.initialize() runs
+        # via accelerator.prepare(). DS uses these to (a) broadcast inside expert_data_parallel_group at
+        # _broadcast_model, (b) partition MoE params inside DP-of-EP under ZeRO-3, (c) put MoE params in
+        # a separate optimizer group via configure_moe_param_groups. The matching `group_name` is set
+        # on each EP-sharded param by GroupedGemmParallel.post_shard_wrap when DS is detected.
+        if self.is_deepspeed_enabled and getattr(self.model, "has_ep", False):
+            from deepspeed.utils import groups as _ds_groups
+
+            ep_size = self.model.tp_size
+            group_name = f"ep_size_{ep_size}"
+            if group_name not in _ds_groups._get_expert_parallel_group_dict():
+                _ds_groups._create_expert_and_data_parallel(ep_size)
+
         # post accelerator creation setup
         if self.is_fsdp_enabled:
             fsdp_plugin = self.accelerator.state.fsdp_plugin
@@ -2510,10 +2523,12 @@ class Trainer:
         """Clip gradients to max_grad_norm. Returns the pre-clip gradient norm."""
         if is_sagemaker_mp_enabled() and self.args.fp16:
             return self.optimizer.clip_master_grads(self.args.max_grad_norm)
-        # EP runs with EP < DP_size place EP gradients on the EP mesh and non-EP gradients on
-        # the FSDP DP mesh. clip_grad_norm_ stacks per-param norms — DTensors on different
-        # meshes can't stack. Skip clipping entirely in that case (benchmark-only path).
-        if getattr(self.model, "has_ep", False):
+        # FSDP + EP: EP gradients are DTensors on the EP mesh, non-EP gradients are on the
+        # FSDP DP mesh. accelerator.clip_grad_norm_ stacks per-param norms — DTensors on
+        # different meshes can't stack. Skip clipping in that case (benchmark-only).
+        # DS-Z3 + EP doesn't hit this: DS partitions MoE params separately and clips
+        # them via its own per-param-group optimizer path.
+        if getattr(self.model, "has_ep", False) and self.is_fsdp_enabled:
             return torch.tensor(0.0, device=self.args.device)
         return self.accelerator.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
 

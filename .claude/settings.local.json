@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(grep -l \"base_model_ep_plan\" /fsx/amine_dirhoussi/transformers/src/transformers/models/*/configuration_*.py)",
+      "Bash(srun --nodes=1:*)",
+      "Bash(/fsx/amine_dirhoussi/transformers/.venv/bin/python:*)",
+      "Bash(/fsx/amine_dirhoussi/transformers/.venv/bin/pip install:*)",
+      "Bash(/fsx/amine_dirhoussi/trl/.venv/bin/python:*)",
+      "Bash(git fetch *)",
+      "Bash(git apply *)",
+      "Bash(gh pr *)",
+      "Bash(git worktree *)",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(RUN_TENSOR_PARALLEL_TESTS=1 .venv/bin/python -m pytest tests/models/gpt_oss/test_modeling_gpt_oss.py -k \"test_ep_forward or test_ep_backward\" -v)",
+      "Bash(git rebase *)",
+      "Bash(git add *)",
+      "Bash(gh api *)",
+      "Bash(python utils/check_modular_conversion.py)",
+      "Bash(/fsx/amine_dirhoussi/transformers-ep-fixes/.venv/bin/python utils/modular_model_converter.py qwen3_vl_moe)",
+      "Bash(/fsx/amine_dirhoussi/transformers-ep-fixes/.venv/bin/python utils/modular_model_converter.py qwen3_omni_moe)"
+    ]
+  }
+}
