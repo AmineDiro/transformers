@@ -16,6 +16,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from functools import wraps
 
+from torch.distributed.tensor import DTensor
+
 from ..utils import logging
 from ..utils.generic import GeneralInterface
 from ..utils.import_utils import (
@@ -370,6 +372,10 @@ def _grouped_linear(
     return out
 
 
+def to_local(p):
+    return p.to_local() if isinstance(p, DTensor) else p
+
+
 def grouped_mm_experts_forward(
     self: torch.nn.Module,
     hidden_states: torch.Tensor,
@@ -423,11 +429,11 @@ def grouped_mm_experts_forward(
     # Also there were no speedup gains from it in my experiments, even in eager mode.
     # NOTE: The grouped_mm kernel only targets the active experts / tokens via the offsets
     if self.has_gate:
-        selected_weights = self.gate_up_proj
-        selected_biases = self.gate_up_proj_bias[expert_ids_g] if self.has_bias else None
+        selected_weights = to_local(self.gate_up_proj)
+        selected_biases = to_local(self.gate_up_proj_bias)[expert_ids_g] if self.has_bias else None
     else:
-        selected_weights = self.up_proj
-        selected_biases = self.up_proj_bias[expert_ids_g] if self.has_bias else None
+        selected_weights = to_local(self.up_proj)
+        selected_biases = to_local(self.up_proj_bias)[expert_ids_g] if self.has_bias else None
 
     # Pre-mask (bwd path).
     selected_hidden_states_g.masked_fill_(sentinel_mask, 0.0)
@@ -446,8 +452,8 @@ def grouped_mm_experts_forward(
         proj_out = self.act_fn(proj_out)  # (S, intermediate_dim)
 
     # Select down projection weights and biases
-    selected_weights = self.down_proj
-    selected_biases = self.down_proj_bias[expert_ids_g] if self.has_bias else None
+    selected_weights = to_local(self.down_proj)
+    selected_biases = to_local(self.down_proj_bias)[expert_ids_g] if self.has_bias else None
 
     # --- Down projection per expert (grouped) ---
     proj_out = _grouped_linear(
