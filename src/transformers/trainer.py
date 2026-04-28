@@ -1198,6 +1198,20 @@ class Trainer:
                 },
             ]
 
+            # DeepSpeed + EP: split MoE-tagged params (param.allreduce=False) into separate
+            # optimizer param groups keyed by group_name. ZeRO-1/2's _configure_moe_settings
+            # asserts at least one param group has 'moe': True; without this, init fails with
+            # "The model has moe layers, but None of the param groups are marked as MoE".
+            if self.is_deepspeed_enabled and getattr(self.model, "has_ep", False):
+                from deepspeed.moe.utils import split_params_into_different_moe_groups_for_optimizer
+
+                # Ensure each group has a 'name' for DS to key the MoE split by
+                for i, g in enumerate(optimizer_grouped_parameters):
+                    g.setdefault("name", f"dense-{i}")
+                optimizer_grouped_parameters = split_params_into_different_moe_groups_for_optimizer(
+                    optimizer_grouped_parameters
+                )
+
             if self.optimizer_cls_and_kwargs is not None:
                 optimizer_cls, optimizer_kwargs = self.optimizer_cls_and_kwargs
             else:
