@@ -38,6 +38,46 @@ if is_torch_available():
 logger = logging.get_logger(__name__)
 
 
+# EP-hang debugging hook. Activated by EP_DEBUG_DIR env var. Writes per-rank JSONL files with
+# per-call (per-layer-per-step) input stats around the EP all_reduce_forward boundary, so we can
+# diff the last-good vs first-bad call when the EP all-reduce on PG ID 2 hangs in 'scheduled,
+# never-started' state. Adds a host-device sync per call for shape/nan/min/max stats — slower
+# but cheap relative to the existing per-step EP communication.
+_EP_LOG_CALL = [0]
+
+
+def _maybe_log_ep(stage, hidden_states, top_k_index, top_k_weights, device_mesh):
+    _dir = os.environ.get("EP_DEBUG_DIR")
+    if _dir is None:
+        return
+    try:
+        import json as _json
+
+        _EP_LOG_CALL[0] += 1
+        rank = device_mesh.get_local_rank()
+        global_rank = int(os.environ.get("RANK", "-1"))
+        rec = {
+            "call": _EP_LOG_CALL[0],
+            "stage": stage,
+            "ep_rank": int(rank),
+            "ep_size": int(device_mesh.size()),
+            "global_rank": global_rank,
+        }
+        h = hidden_states.detach()
+        rec["h_shape"] = list(h.shape)
+        rec["h_dtype"] = str(h.dtype)
+        # No .item() syncs to keep timing close to baseline; only shape info.
+        if top_k_index is not None:
+            rec["tki_shape"] = list(top_k_index.shape)
+        if top_k_weights is not None:
+            rec["tkw_shape"] = list(top_k_weights.shape)
+        os.makedirs(_dir, exist_ok=True)
+        with open(f"{_dir}/ep_rank{global_rank}.jsonl", "a") as f:
+            f.write(_json.dumps(rec) + "\n")
+    except Exception as _e:
+        print(f"[ep_debug] error: {_e}", flush=True)
+
+
 def initialize_tensor_parallelism(
     tp_plan: str | dict[str, str] | None, tp_size: int | None = None, device_mesh=None, device_map=None
 ):
@@ -1112,20 +1152,15 @@ class GroupedGemmParallel(TensorParallelLayer):
           this, Adam's foreach ops error with "mixed Tensor and DTensor" against
           FSDP-wrapped DTensor params on the rest of the model.
         """
-        # Benchmark gate: TRANSFORMERS_SKIP_EP_DTENSOR_WRAP=1 leaves EP params as plain
-        # nn.Parameter (debug/bisect only).
-        import os
-        if os.environ.get("TRANSFORMERS_SKIP_EP_DTENSOR_WRAP", "") == "1":
-            return param
-
         # Detect any active DeepSpeed config (Z1/Z2/Z3 — only Z1/Z2 have native MoE plumbing).
         from .deepspeed import _hf_deepspeed_config_weak_ref
+
         ds_active = _hf_deepspeed_config_weak_ref is not None and _hf_deepspeed_config_weak_ref() is not None
         if ds_active:
             # MoE markers consumed by DS's `is_moe_param(p)` (param.allreduce=False).
             # In ZeRO-1/2: stage_1_and_2.py uses these to route grad reduce through
             # `expert_dp_process_group` and put MoE params in a separate optim group.
-            # In ZeRO-3: stage3.py has no MoE plumbing — additional upstream work needed.
+            # TODO: In ZeRO-3: stage3.py has no MoE plumbing
             param.allreduce = False
             param.group_name = f"ep_size_{self.device_mesh.size()}"
             return param
@@ -1238,6 +1273,8 @@ class MoeTensorParalellExperts(TensorParallelLayer):
         top_k_index = inputs[1]
         top_k_weights = inputs[2]
 
+        _maybe_log_ep("in", hidden_states, top_k_index, top_k_weights, device_mesh)
+
         # all_reduce_backward on hidden_states for correct colwise (gate_up_proj) gradient
         hidden_states = all_reduce_backward(hidden_states, device_mesh)
 
@@ -1249,6 +1286,7 @@ class MoeTensorParalellExperts(TensorParallelLayer):
         return (hidden_states, top_k_index, top_k_weights)
 
     def _prepare_output_fn(self, mod, outputs, device_mesh):
+        _maybe_log_ep("out", outputs, None, None, device_mesh)
         # all_reduce_forward to sum partial expert outputs across GPUs
         return all_reduce_forward(outputs, device_mesh)
 

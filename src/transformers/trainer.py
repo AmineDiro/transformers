@@ -745,6 +745,40 @@ class Trainer:
             elif args["parallelism_config"].tp_size != self.model.tp_size:
                 args["parallelism_config"].tp_size = self.model.tp_size
 
+        # Phase 1 — EP-as-TP via accelerate's ParallelismConfig (FSDP/MULTI_GPU path only).
+        # transformers' EP mesh is dim-named "tp"; registering EP under accelerate's `tp_size`
+        # is semantically correct (EP and TP are both data-replicate dims for dataloader
+        # sharding) and lets accelerate's existing TP code paths handle the rest:
+        #   - mesh: 2D `(dp_shard, tp)` of shape `(world//ep_size, ep_size)`.
+        #   - FSDP wrap reads `mesh[fsdp_dim_names]` = `mesh["dp_shard_cp"]` (the dp_shard sub-dim).
+        #   - `prepare_data_loader` divides `process_index` by `submesh_tp_size` natively.
+        #   - `_prepare_tp` is skipped via the upstream-side `model._device_mesh is not None`
+        #     early-return in accelerate (Phase 1 accelerate PR).
+        # The DEEPSPEED path is handled separately in `create_accelerator_and_postprocess`
+        # (via `state.ds_device_mesh = model._device_mesh`) — DS doesn't go through ParallelismConfig.
+        if (
+            getattr(self.model, "has_ep", False)
+            and getattr(self.model, "tp_size", None) is not None
+            and self.model.tp_size > 1
+            and args.get("deepspeed_plugin") is None
+        ):
+            if not is_accelerate_available("1.12.0"):
+                raise ValueError("EP via ParallelismConfig requires accelerate>=1.12.0.")
+            from accelerate import ParallelismConfig
+
+            ep_size = self.model.tp_size
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+            dp_shard_size = max(world_size // ep_size, 1)
+            if args.get("parallelism_config") is None:
+                args["parallelism_config"] = ParallelismConfig(
+                    tp_size=ep_size,
+                    dp_shard_size=dp_shard_size,
+                )
+            else:
+                args["parallelism_config"].tp_size = ep_size
+                if args["parallelism_config"].dp_shard_size in (None, 1):
+                    args["parallelism_config"].dp_shard_size = dp_shard_size
+
         if is_accelerate_available("1.2.0"):
             # it we don't have the correct version, we will rely on env var instead that were set in TrainingArguments
             from accelerate.utils import TorchDynamoPlugin
@@ -839,6 +873,47 @@ class Trainer:
             group_name = f"ep_size_{ep_size}"
             if group_name not in _ds_groups._get_expert_parallel_group_dict():
                 _ds_groups._create_expert_and_data_parallel(ep_size)
+
+            # Extend DS's MoE auto-detection so external EP (transformers' params tagged
+            # `allreduce=False` + `group_name` by GroupedGemmParallel.post_shard_wrap) flips
+            # `has_moe_layers=True` and `_configure_moe_settings` runs at optimizer init.
+            # Replaces the in-tree engine.py shim; lives entirely on the transformers side.
+            import deepspeed.runtime.engine as _ds_engine
+
+            if not getattr(_ds_engine.DeepSpeedEngine, "_external_moe_patched", False):
+                _orig_cdm = _ds_engine.DeepSpeedEngine._configure_distributed_model
+
+                def _wrapped_cdm(engine, model):
+                    _orig_cdm(engine, model)
+                    if not engine.has_moe_layers:
+                        for _, mod in engine.module.named_modules():
+                            if any(getattr(p, "allreduce", True) is False for p in mod.parameters(recurse=False)):
+                                engine.has_moe_layers = True
+                                engine.num_experts.append(getattr(mod, "num_experts", 0))
+
+                _ds_engine.DeepSpeedEngine._configure_distributed_model = _wrapped_cdm
+                _ds_engine.DeepSpeedEngine._external_moe_patched = True
+
+        # Phase 1 — EP-as-TP registration with accelerate.
+        # transformers' EP mesh has `mesh_dim_names=("tp",)` (set in `distribute_model`); EP and TP
+        # are equivalent for dataloader sharding (both data-replicate dims). Two paths:
+        #
+        # - DS: accelerate's `_prepare_device_mesh` returns `state.ds_device_mesh` for DS, and
+        #   `prepare_data_loader`'s DEEPSPEED branch divides `process_index`/`num_processes` by the
+        #   "tp" submesh size. Drop the EP mesh into that slot directly. No ParallelismConfig.
+        #
+        # - FSDP: handled in `_build_accelerator_args` by setting `parallelism_config.tp_size = ep_size`
+        #   so accelerate builds a 2D `(dp_shard, tp)` mesh natively. FSDP wraps on `dp_shard_cp`,
+        #   dataloader divides on `tp`. `_prepare_tp` is then skipped via the upstream-side
+        #   `model._device_mesh is not None` early-return (Phase 1 accelerate PR).
+        if (
+            self.is_deepspeed_enabled
+            and getattr(self.model, "has_ep", False)
+            and getattr(self.accelerator.state, "ds_device_mesh", None) is None
+        ):
+            ep_mesh = getattr(self.model, "_device_mesh", None)
+            if ep_mesh is not None and "tp" in (ep_mesh.mesh_dim_names or ()):
+                self.accelerator.state.ds_device_mesh = ep_mesh
 
         # post accelerator creation setup
         if self.is_fsdp_enabled:
@@ -1018,6 +1093,53 @@ class Trainer:
                     seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index
                 )
 
+        # === C3 PIGGYBACK (FSDP path) — REPLACED 2026-05-05 by Phase 1 EP-as-TP via
+        # === `parallelism_config.tp_size = ep_size` in `_build_accelerator_args`. The native
+        # === `prepare_data_loader` TP-replication branch (data_loader.py:1146-1154) then divides
+        # === `process_index` by `submesh_tp_size` automatically. Kept commented for rollback
+        # === until validated end-to-end. Once Phase 1 validates (Test G shape — 64k 2n DS-Z2
+        # === EP=8 + FSDP variant equivalent), delete this entire block.
+        # ep_patch_active = (
+        #     getattr(self.model, "has_ep", False)
+        #     and self.is_fsdp_enabled
+        #     and getattr(self.model, "_tp_size", 1) > 1
+        # )
+        # if ep_patch_active:
+        #     from accelerate.data_loader import prepare_data_loader as _prep_dl
+        #
+        #     ep_size = self.model._tp_size
+        #     eff_num = self.accelerator.num_processes // ep_size
+        #     eff_idx = self.accelerator.process_index // ep_size
+        #     orig_prepare_dl = self.accelerator.prepare_data_loader
+        #
+        #     def _patched(dataloader, device_placement=None, slice_fn_for_dispatch=None):
+        #         if device_placement is None:
+        #             device_placement = self.accelerator.device_placement
+        #         return _prep_dl(
+        #             dataloader,
+        #             self.accelerator.device,
+        #             num_processes=eff_num,
+        #             process_index=eff_idx,
+        #             split_batches=self.accelerator.split_batches,
+        #             put_on_device=device_placement,
+        #             rng_types=self.accelerator.rng_types.copy(),
+        #             dispatch_batches=self.accelerator.dispatch_batches,
+        #             even_batches=self.accelerator.even_batches,
+        #             slice_fn_for_dispatch=slice_fn_for_dispatch,
+        #             use_seedable_sampler=self.accelerator.use_seedable_sampler,
+        #             data_seed=self.accelerator.dataloader_config.data_seed,
+        #             non_blocking=self.accelerator.non_blocking,
+        #             use_stateful_dataloader=self.accelerator.use_stateful_dataloader,
+        #             torch_device_mesh=None,
+        #         )
+        #
+        #     self.accelerator.prepare_data_loader = _patched
+        #
+        # try:
+        #     dataloader = self.accelerator.prepare(DataLoader(dataset, **dataloader_params))
+        # finally:
+        #     if ep_patch_active:
+        #         self.accelerator.prepare_data_loader = orig_prepare_dl
         dataloader = self.accelerator.prepare(DataLoader(dataset, **dataloader_params))
 
         # Store the prepared dataloader for subsequent evaluations if using persistent workers.
