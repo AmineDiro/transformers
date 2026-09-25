@@ -65,6 +65,20 @@ class GptOssRMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
+def _clamped_swiglu_eager(gate_up: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
+    gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+    gate = gate.clamp(min=None, max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    glu = gate * torch.sigmoid(gate * alpha)
+    return (up + 1) * glu
+
+
+# Eager, this is six memory-bound passes over a (tokens, 2 * intermediate) tensor per layer, forward and
+# backward; fused it is one. `dynamic=True` because the row count changes every step under expert
+# dispatch, and a recompile per shape would cost more than the fusion saves.
+_clamped_swiglu = torch.compile(_clamped_swiglu_eager, dynamic=True)
+
+
 @use_experts_implementation(is_concatenated=False, is_transposed=True, has_bias=True)
 class GptOssExperts(nn.Module):
     def __init__(self, config):
@@ -80,12 +94,7 @@ class GptOssExperts(nn.Module):
         self.limit = 7.0
 
     def _apply_gate(self, gate_up: torch.Tensor) -> torch.Tensor:
-        gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-        gate = gate.clamp(min=None, max=self.limit)
-        up = up.clamp(min=-self.limit, max=self.limit)
-        glu = gate * torch.sigmoid(gate * self.alpha)
-        gated_output = (up + 1) * glu
-        return gated_output
+        return _clamped_swiglu(gate_up, self.alpha, self.limit)
 
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
         next_states = torch.zeros_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)
