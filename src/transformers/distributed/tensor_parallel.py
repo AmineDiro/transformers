@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import os
 import contextlib
 import re
 from collections.abc import Callable
@@ -605,6 +606,83 @@ if is_torch_distributed_available():
         def backward(ctx, grad_output):
             return grad_output * ctx.scale, None
 
+    class _GatherTokens(torch.autograd.Function):
+        """`hidden[gather_idx]` where every row index repeats `top_k` times.
+
+        The default backward scatter-adds the `top_k` gradients of each token into one row, which sends
+        PyTorch down the sort-based deterministic `index_put_` path. Reading each token's `top_k` gathered
+        rows back and summing them is the same reduction with no scatter and no atomics.
+        """
+
+        @staticmethod
+        def forward(ctx, hidden, gather_idx, inverse_by_token):
+            ctx.save_for_backward(inverse_by_token)
+            return hidden.index_select(0, gather_idx)
+
+        @staticmethod
+        def backward(ctx, grad_gathered):
+            (inverse_by_token,) = ctx.saved_tensors
+            num_tokens, num_top_k = inverse_by_token.shape
+            grad = grad_gathered.index_select(0, inverse_by_token.reshape(-1))
+            return grad.view(num_tokens, num_top_k, -1).sum(dim=1), None, None
+
+    class _Permute(torch.autograd.Function):
+        """`x[idx]` for a permutation `idx`; the backward is the inverse permutation, not an `index_put_`."""
+
+        @staticmethod
+        def forward(ctx, x, idx, inverse_idx):
+            ctx.save_for_backward(inverse_idx)
+            return x.index_select(0, idx)
+
+        @staticmethod
+        def backward(ctx, grad):
+            (inverse_idx,) = ctx.saved_tensors
+            return grad.index_select(0, inverse_idx), None, None
+
+    class _ReplayAllToAll(torch.autograd.Function):
+        """Return a cached all-to-all output on a gradient-checkpoint recompute; backward still runs the
+        reverse all-to-all, so this is correct under both reentrant and non-reentrant checkpointing."""
+
+        @staticmethod
+        def forward(ctx, x, cached_output, output_split_sizes, input_split_sizes, group):
+            ctx.group, ctx.input_size = group, x.size()
+            ctx.output_split_sizes, ctx.input_split_sizes = input_split_sizes, output_split_sizes
+            return cached_output
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            grad_input = grad_output.new_empty(ctx.input_size)
+            dist.all_to_all_single(
+                grad_input,
+                grad_output.contiguous(),
+                output_split_sizes=ctx.output_split_sizes,
+                input_split_sizes=ctx.input_split_sizes,
+                group=ctx.group,
+            )
+            return grad_input, None, None, None, None
+
+
+class _DispatchCache:
+    """Dispatch collectives cached for the current forward so a gradient-checkpoint recompute replays
+    them instead of re-running the all-to-all. A checkpointed layer runs its body twice; the second
+    run only needs the expert math, not the communication. Keyed per experts module; entries are
+    filled on the first pass and consumed by the recompute, and the model-level pre-hook clears them
+    and re-reads whether checkpointing is on at every root forward."""
+
+    def __init__(self):
+        self.enabled = False
+        self.entries: dict[int, list] = {}
+
+    def pop(self, key):
+        stack = self.entries.get(key)
+        return stack.pop() if stack else None
+
+    def push(self, key, entry):
+        self.entries.setdefault(key, []).append(entry)
+
+
+_DISPATCH_CACHE = _DispatchCache()
+
 
 class MoeExpertsParallel(TensorParallelLayer):
     def should_use_local_tensors(self, module):
@@ -769,6 +847,7 @@ def dispatch_experts_forward(
     ep_group,
     ep_size: int,
     tp_size: int = 1,
+    cache_key=None,
 ) -> torch.Tensor:
     """
     Expert-parallel forward by token dispatch. Every rank routes its own token slice, sends each selected (token, expert)
@@ -788,19 +867,28 @@ def dispatch_experts_forward(
     # sizes are the one host sync of the layer.
     expert_ids = top_k_index.reshape(-1)
     order = torch.argsort(expert_ids)
-    send_tokens = hidden_states[order // num_top_k]
-    send_counts = torch.zeros(num_local_experts * ep_size, dtype=torch.long, device=hidden_states.device)
-    send_counts = send_counts.scatter_add_(0, expert_ids, torch.ones_like(expert_ids)).view(ep_size, num_local_experts)
-    recv_counts = torch.empty_like(send_counts)
-    torch.distributed.all_to_all_single(recv_counts, send_counts, group=ep_group)
-    send_sizes, recv_sizes = torch.stack([send_counts.sum(dim=1), recv_counts.sum(dim=1)]).tolist()
-    recv_tokens = all_to_all_single(
-        send_tokens.new_empty(sum(recv_sizes), hidden_dim),
-        send_tokens,
-        output_split_sizes=recv_sizes,
-        input_split_sizes=send_sizes,
-        group=ep_group,
-    )
+    inverse_order = torch.argsort(order)
+    # Every token appears `num_top_k` times in `order // num_top_k`; `_GatherTokens` keeps its backward off
+    # the duplicate-index scatter path by summing each token's `num_top_k` slots instead.
+    send_tokens = _GatherTokens.apply(hidden_states, order // num_top_k, inverse_order.view(num_tokens, num_top_k))
+    cached = _DISPATCH_CACHE.pop(cache_key) if cache_key is not None else None
+    if cached is None:
+        send_counts = torch.zeros(num_local_experts * ep_size, dtype=torch.long, device=hidden_states.device)
+        send_counts = send_counts.scatter_add_(0, expert_ids, torch.ones_like(expert_ids)).view(ep_size, num_local_experts)
+        recv_counts = torch.empty_like(send_counts)
+        torch.distributed.all_to_all_single(recv_counts, send_counts, group=ep_group)
+        send_sizes, recv_sizes = torch.stack([send_counts.sum(dim=1), recv_counts.sum(dim=1)]).tolist()
+        recv_tokens = all_to_all_single(
+            send_tokens.new_empty(sum(recv_sizes), hidden_dim),
+            send_tokens,
+            output_split_sizes=recv_sizes,
+            input_split_sizes=send_sizes,
+            group=ep_group,
+        )
+    else:
+        # Gradient-checkpoint recompute: the routing, counts and both all-to-all results are already known.
+        recv_counts, send_sizes, recv_sizes, cached_recv_tokens, cached_recv_out = cached
+        recv_tokens = _ReplayAllToAll.apply(send_tokens, cached_recv_tokens, recv_sizes, send_sizes, ep_group)
     recv_expert_ids = torch.arange(num_local_experts, device=hidden_states.device).repeat(ep_size)
     recv_expert_ids = recv_expert_ids.repeat_interleave(recv_counts.reshape(-1), output_size=sum(recv_sizes))
 
@@ -813,16 +901,21 @@ def dispatch_experts_forward(
     expert_out = _ScaleGrad.apply(expert_out, expert_gradient_scale)
 
     # Send the results back to the owners of the tokens and combine them with the routing weights.
-    recv_out = all_to_all_single(
-        expert_out.new_empty(send_tokens.size(0), hidden_dim),
-        expert_out,
-        output_split_sizes=send_sizes,
-        input_split_sizes=recv_sizes,
-        group=ep_group,
-    )
-    inverse_order = torch.empty_like(order)
-    inverse_order[order] = torch.arange(order.numel(), device=order.device)
-    combined = recv_out[inverse_order] * top_k_weights.reshape(-1, 1)
+    if cached is None:
+        recv_out = all_to_all_single(
+            expert_out.new_empty(send_tokens.size(0), hidden_dim),
+            expert_out,
+            output_split_sizes=send_sizes,
+            input_split_sizes=recv_sizes,
+            group=ep_group,
+        )
+        if cache_key is not None and _DISPATCH_CACHE.enabled:
+            _DISPATCH_CACHE.push(
+                cache_key, (recv_counts, send_sizes, recv_sizes, recv_tokens.detach(), recv_out.detach())
+            )
+    else:
+        recv_out = _ReplayAllToAll.apply(expert_out, cached_recv_out, send_sizes, recv_sizes, ep_group)
+    combined = _Permute.apply(recv_out, inverse_order, order) * top_k_weights.reshape(-1, 1)
     return combined.view(num_tokens, num_top_k, hidden_dim).sum(dim=1).to(hidden_states.dtype)
 
 
@@ -877,6 +970,7 @@ class EpDispatchExpertsParallel(MoeExpertsParallel):
                     ep_group,
                     ep_size,
                     tp_size=tp_size,
+                    cache_key=id(module),
                 )
             if tp_size > 1:
                 full_output = output.new_zeros(num_tokens, output.size(-1))
@@ -1029,6 +1123,19 @@ def apply_dispatch_expert_parallelism(
     model: nn.Module, ep_mesh: DeviceMesh, tp_mesh: DeviceMesh, plan: dict[str, str]
 ):
     """Shard experts on EP; use TP to split shared tokens and reconstruct outputs around dispatch."""
+
+    def _start_forward(root, args):
+        # A checkpointed layer's recompute re-enters the experts module during backward, not through the
+        # root model, so a fresh root forward is the boundary at which cached dispatches go stale.
+        _DISPATCH_CACHE.entries.clear()
+        # Opt-in: measured at 0-3 % on gpt-oss-20b for 10-36 GB of cached activations, so it is not a default.
+        _DISPATCH_CACHE.enabled = (
+            os.environ.get("TRANSFORMERS_EP_DISPATCH_REPLAY", "0") == "1"
+            and torch.is_grad_enabled()
+            and bool(getattr(root, "is_gradient_checkpointing", False))
+        )
+
+    model.register_forward_pre_hook(_start_forward)
     for name, module in model.named_modules():
         for p_name, _ in list(module.named_parameters(recurse=False)):
             full = f"{name}.{p_name}" if name else p_name

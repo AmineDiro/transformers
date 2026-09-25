@@ -380,6 +380,29 @@ def _grouped_linear(
     return out
 
 
+class _ExpertBiasGather(torch.autograd.Function):
+    """`bias[expert_ids]` for expert-sorted tokens, with the gradient as one GEMM.
+
+    Every token of an expert indexes the same bias row, so the default backward is an `index_put_` that
+    accumulates thousands of duplicates into a handful of rows; CUDA routes that to a sort-based kernel
+    whose per-row reduction is serial, and it gets slower the fewer local experts there are. Summing
+    the gradient per expert as `onehot(expert_ids) @ grad` is the same reduction on tensor cores with
+    fp32 accumulation and no atomics.
+    """
+
+    @staticmethod
+    def forward(ctx, bias: torch.Tensor, expert_ids: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(expert_ids)
+        ctx.num_experts = bias.size(0)
+        return bias.index_select(0, expert_ids)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        (expert_ids,) = ctx.saved_tensors
+        onehot = (torch.arange(ctx.num_experts, device=expert_ids.device)[:, None] == expert_ids[None, :]).to(grad_out.dtype)
+        return onehot @ grad_out, None
+
+
 def grouped_mm_experts_forward(
     self: torch.nn.Module,
     hidden_states: torch.Tensor,
@@ -436,10 +459,10 @@ def grouped_mm_experts_forward(
     # NOTE: The grouped_mm kernel only targets the active experts / tokens via the offsets
     if self.has_gate:
         selected_weights = self.gate_up_proj
-        selected_biases = self.gate_up_proj_bias[expert_ids_g] if self.has_bias else None
+        selected_biases = _ExpertBiasGather.apply(self.gate_up_proj_bias, expert_ids_g) if self.has_bias else None
     else:
         selected_weights = self.up_proj
-        selected_biases = self.up_proj_bias[expert_ids_g] if self.has_bias else None
+        selected_biases = _ExpertBiasGather.apply(self.up_proj_bias, expert_ids_g) if self.has_bias else None
 
     # Pre-mask (bwd path).
     if sentinel_mask is not None:
@@ -464,7 +487,7 @@ def grouped_mm_experts_forward(
 
     # Select down projection weights and biases
     selected_weights = self.down_proj
-    selected_biases = self.down_proj_bias[expert_ids_g] if self.has_bias else None
+    selected_biases = _ExpertBiasGather.apply(self.down_proj_bias, expert_ids_g) if self.has_bias else None
 
     # --- Down projection per expert (grouped) ---
     proj_out = _grouped_linear(
