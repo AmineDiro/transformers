@@ -116,7 +116,8 @@ def eager_attention_forward(
     attention_mask: torch.Tensor | None,
     scaling: float,
     dropout: float = 0.0,
-    position_bias: torch.Tensor | None = None,
+    rel_logits: torch.Tensor | None = None,
+    relative_positions: tuple[torch.Tensor, torch.Tensor] | None = None,
     sinks: torch.Tensor | None = None,
     **kwargs,
 ):
@@ -124,7 +125,13 @@ def eager_attention_forward(
     value_states = repeat_kv(value, module.num_key_value_groups)
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if position_bias is not None:
+    if rel_logits is not None:
+        q_positions, kv_positions = relative_positions
+        relative_distance = q_positions[:, None] - kv_positions[None, :]
+        rel_extent = rel_logits.shape[-1]
+        gather_index = relative_distance.clamp(0, rel_extent - 1).expand(*rel_logits.shape[:2], -1, -1)
+        position_bias = rel_logits.gather(-1, gather_index)
+        position_bias = position_bias.masked_fill((relative_distance < 0) | (relative_distance >= rel_extent), 0.0)
         attn_weights = attn_weights + position_bias
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask
@@ -239,9 +246,9 @@ class Inkling2LoopLogScaledL2Clip(nn.Module):
 class Inkling2LoopRelativePositionBias(nn.Module):
     """
     Hidden-states conditioned relative position bias. `linear` and `norm` give each token per-head `relative_states`
-    that mix the trained bank of bias-vs-distance profiles in `proj` into one bias value per backward distance. The
-    bias is zero outside `0 <= distance < rel_extent`. With `log_scaling`, the relative states are also scaled by
-    `Inkling2LoopLogScale`.
+    that mix the trained bank of bias-vs-distance profiles in `proj` into one bias value per backward distance, the
+    `rel_logits` the attention function adds to its scores. The bias is zero outside `0 <= distance < rel_extent`.
+    With `log_scaling`, the relative states are also scaled by `Inkling2LoopLogScale`.
     """
 
     # trf-ignore: TRF029 (num_heads depends on the attention layer type)
@@ -257,17 +264,12 @@ class Inkling2LoopRelativePositionBias(nn.Module):
         )
         self.proj = nn.Parameter(torch.empty(config.d_rel, rel_extent))
 
-    def forward(
-        self, hidden_states: torch.Tensor, relative_distance: torch.Tensor, position_ids: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         relative_states = self.linear(hidden_states).view(*hidden_states.shape[:-1], self.num_heads, -1)
         relative_states = self.norm(relative_states, position_ids)
 
-        # relative_states: [batch, q_len, num_heads, d_rel] -> bias: [batch, num_heads, q_len, kv_len]
-        rel_logits = (relative_states @ self.proj).transpose(1, 2)
-        gather_index = relative_distance.clamp(0, self.rel_extent - 1).expand(*rel_logits.shape[:2], -1, -1)
-        position_bias = rel_logits.gather(-1, gather_index)
-        return position_bias.masked_fill((relative_distance < 0) | (relative_distance >= self.rel_extent), 0.0)
+        # relative_states: [batch, q_len, num_heads, d_rel] -> rel_logits: [batch, num_heads, q_len, rel_extent]
+        return (relative_states @ self.proj).transpose(1, 2)
 
 
 def apply_mask_to_padding_states(hidden_states, attention_mask):
@@ -380,9 +382,7 @@ class Inkling2LoopShortConvolution(nn.Module):
                     hidden_states, cache_layer_idx, state_idx=self.conv_idx, conv_kernel_size=self.conv_kernel_size
                 )
 
-            hidden_states = causal_conv1d_fn(
-                hidden_states, self.conv1d.weight.squeeze(1), self.conv1d.bias, seq_idx=kwargs.get("seq_idx")
-            )
+            hidden_states = causal_conv1d_fn(hidden_states, self.conv1d.weight.squeeze(1), self.conv1d.bias, **kwargs)
 
             if cache is not None:
                 hidden_states = hidden_states[:, :, -seq_len:]
@@ -391,6 +391,27 @@ class Inkling2LoopShortConvolution(nn.Module):
         # Different from Inkling which has no output scale
         hidden_states = (hidden_states + residual) / math.sqrt(self.conv_kernel_size + 1)
         return hidden_states.to(dtype=input_dtype)
+
+
+def dynamic_causal_conv1d_fn(
+    context: torch.Tensor, weights: torch.Tensor, seq_idx: torch.Tensor | None = None, **kwargs
+) -> torch.Tensor:
+    """
+    Causal convolution with per-token taps. `context` of shape `(batch_size, channels, conv_kernel_size - 1 +
+    sequence_length)` holds the previous states, then the new ones. `weights` of shape `(batch_size, sequence_length,
+    num_heads, 1, conv_kernel_size)` holds the taps of each token and head: tap `lag` weights the token `lag` steps
+    back. Returns `(batch_size, sequence_length, channels)`.
+    """
+    batch_size, seq_len, num_heads, _, conv_kernel_size = weights.shape
+    # windows[..., lag] is the token `lag` steps back
+    windows = context.unfold(-1, conv_kernel_size, 1).flip(-1).transpose(1, 2)
+    windows = windows.reshape(batch_size, seq_len, num_heads, -1, conv_kernel_size)
+    if seq_idx is not None:
+        seq_idx = seq_idx.to(windows.device)
+        context_seq_idx = torch.cat([seq_idx[:, :1].expand(-1, conv_kernel_size - 1), seq_idx], dim=1)
+        window_seq_idx = context_seq_idx.unfold(-1, conv_kernel_size, 1).flip(-1)
+        windows = windows * (window_seq_idx == seq_idx[..., None])[:, :, None, None, :]
+    return (windows * weights).sum(-1).reshape(batch_size, seq_len, -1)
 
 
 class Inkling2LoopDynamicShortConvolution(nn.Module):
@@ -426,7 +447,7 @@ class Inkling2LoopDynamicShortConvolution(nn.Module):
             Offset added to `layer_idx` to get the cache layer holding the state of this call.
         """
         input_dtype = hidden_states.dtype
-        batch_size, seq_len, hidden_size = hidden_states.shape
+        batch_size, seq_len, _ = hidden_states.shape
         dynamic_weights = self.weight_proj(dynamic_input).float()
         dynamic_weights = dynamic_weights.view(batch_size, seq_len, self.num_heads, 1, self.conv_kernel_size)
         weights = self.static_weight.float().T.view(self.num_heads, -1, self.conv_kernel_size) + dynamic_weights
@@ -442,15 +463,7 @@ class Inkling2LoopDynamicShortConvolution(nn.Module):
                 conv_kernel_size=self.conv_kernel_size,
             )
         context = F.pad(context, (self.conv_kernel_size - 1, 0))[..., -(seq_len + self.conv_kernel_size - 1) :]
-        # windows[..., lag] is the token `lag` steps back
-        windows = context.unfold(-1, self.conv_kernel_size, 1).flip(-1).transpose(1, 2)
-        windows = windows.reshape(batch_size, seq_len, self.num_heads, -1, self.conv_kernel_size)
-        if (seq_idx := kwargs.get("seq_idx")) is not None:
-            seq_idx = seq_idx.to(windows.device)
-            context_seq_idx = torch.cat([seq_idx[:, :1].expand(-1, self.conv_kernel_size - 1), seq_idx], dim=1)
-            window_seq_idx = context_seq_idx.unfold(-1, self.conv_kernel_size, 1).flip(-1)
-            windows = windows * (window_seq_idx == seq_idx[..., None])[:, :, None, None, :]
-        hidden_states = (windows * weights).sum(-1).reshape(batch_size, seq_len, hidden_size)
+        hidden_states = dynamic_causal_conv1d_fn(context, weights, **kwargs)
         hidden_states = (hidden_states + residual) / math.sqrt(2 * self.conv_kernel_size + 1)
         return hidden_states.to(input_dtype)
 
@@ -576,7 +589,7 @@ class Inkling2LoopSlidingAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None,
-        relative_distance: torch.Tensor,
+        relative_positions: tuple[torch.Tensor, torch.Tensor],
         conv_mask: torch.Tensor | None = None,
         cache: Cache | None = None,
         key_hidden_states: torch.Tensor | None = None,
@@ -585,8 +598,8 @@ class Inkling2LoopSlidingAttention(nn.Module):
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         r"""
-        relative_distance (`torch.Tensor` of shape `(query_length, key_length)`):
-            Distance from each query position to each key position, see `get_relative_distance`.
+        relative_positions (`tuple[torch.Tensor, torch.Tensor]`):
+            Positions of the queries and of the keys, see `get_relative_positions`.
         key_hidden_states (`torch.Tensor`, *optional*):
             Input of the key projection, `hidden_states` by default.
         value_hidden_states (`torch.Tensor`, *optional*):
@@ -615,7 +628,7 @@ class Inkling2LoopSlidingAttention(nn.Module):
             self.config._attn_implementation, eager_attention_forward
         )
 
-        position_bias = self.relative_position_bias(hidden_states, relative_distance, kwargs["position_ids"])
+        rel_logits = self.relative_position_bias(hidden_states, kwargs["position_ids"])
         sinks = self.sink_proj(hidden_states).transpose(1, 2).unsqueeze(-1)
         attn_output, attn_weights = attention_interface(
             self,
@@ -626,7 +639,8 @@ class Inkling2LoopSlidingAttention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
-            position_bias=position_bias,
+            rel_logits=rel_logits,
+            relative_positions=relative_positions,
             sinks=sinks,
             **kwargs,
         )
@@ -671,15 +685,15 @@ class Inkling2LoopFullAttention(nn.Module):
         key_hidden_states: torch.Tensor,
         value_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None,
-        relative_distance: torch.Tensor,
+        relative_positions: tuple[torch.Tensor, torch.Tensor],
         conv_mask: torch.Tensor | None = None,
         cache: Cache | None = None,
         cache_offset: int = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         r"""
-        relative_distance (`torch.Tensor` of shape `(query_length, key_length)`):
-            Distance from each query position to each key position, see `get_relative_distance`.
+        relative_positions (`tuple[torch.Tensor, torch.Tensor]`):
+            Positions of the queries and of the keys, see `get_relative_positions`.
         key_hidden_states (`torch.Tensor`):
             Input of the key projection and of the key convolution weights.
         value_hidden_states (`torch.Tensor`):
@@ -706,7 +720,7 @@ class Inkling2LoopFullAttention(nn.Module):
             self.config._attn_implementation, eager_attention_forward
         )
 
-        position_bias = self.relative_position_bias(hidden_states, relative_distance, kwargs["position_ids"])
+        rel_logits = self.relative_position_bias(hidden_states, kwargs["position_ids"])
         sinks = self.sink_proj(hidden_states).transpose(1, 2).unsqueeze(-1)
         attn_output, attn_weights = attention_interface(
             self,
@@ -717,7 +731,8 @@ class Inkling2LoopFullAttention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
-            position_bias=position_bias,
+            rel_logits=rel_logits,
+            relative_positions=relative_positions,
             sinks=sinks,
             **kwargs,
         )
@@ -878,7 +893,7 @@ class Inkling2LoopSlidingDecoderLayer(GradientCheckpointingLayer):
         hidden_states: torch.Tensor,
         block_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        relative_distance: torch.Tensor | None = None,
+        relative_positions: tuple[torch.Tensor, torch.Tensor] | None = None,
         conv_mask: torch.Tensor | None = None,
         cache: Cache | None = None,
         **kwargs: Unpack[TransformersKwargs],
@@ -891,7 +906,7 @@ class Inkling2LoopSlidingDecoderLayer(GradientCheckpointingLayer):
         hidden_states, _ = self.self_attn(
             hidden_states=self.input_layernorm(hidden_states).to(dtype),
             attention_mask=attention_mask,
-            relative_distance=relative_distance,
+            relative_positions=relative_positions,
             conv_mask=conv_mask,
             cache=cache,
             **kwargs,
@@ -940,7 +955,7 @@ class Inkling2LoopSlidingLoopDecoderLayer(GradientCheckpointingLayer):
         block_states: torch.Tensor,
         messages: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        relative_distance: torch.Tensor | None = None,
+        relative_positions: tuple[torch.Tensor, torch.Tensor] | None = None,
         conv_mask: torch.Tensor | None = None,
         cache: Cache | None = None,
         cache_offset: int = 0,
@@ -971,7 +986,7 @@ class Inkling2LoopSlidingLoopDecoderLayer(GradientCheckpointingLayer):
             key_hidden_states=key_hidden_states.to(dtype),
             value_hidden_states=value_hidden_states.to(dtype),
             attention_mask=attention_mask,
-            relative_distance=relative_distance,
+            relative_positions=relative_positions,
             conv_mask=conv_mask,
             cache=cache,
             cache_offset=cache_offset,
@@ -1024,7 +1039,7 @@ class Inkling2LoopFullDecoderLayer(GradientCheckpointingLayer):
         hidden_states: torch.Tensor,
         block_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        relative_distance: torch.Tensor | None = None,
+        relative_positions: tuple[torch.Tensor, torch.Tensor] | None = None,
         conv_mask: torch.Tensor | None = None,
         cache: Cache | None = None,
         **kwargs: Unpack[TransformersKwargs],
@@ -1043,7 +1058,7 @@ class Inkling2LoopFullDecoderLayer(GradientCheckpointingLayer):
             key_hidden_states=self.k_input_layernorm(key_hidden_states).to(dtype),
             value_hidden_states=self.v_input_layernorm(value_hidden_states).to(dtype),
             attention_mask=attention_mask,
-            relative_distance=relative_distance,
+            relative_positions=relative_positions,
             conv_mask=conv_mask,
             cache=cache,
             **kwargs,
@@ -1094,7 +1109,7 @@ class Inkling2LoopFullLoopDecoderLayer(GradientCheckpointingLayer):
         block_states: torch.Tensor,
         messages: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        relative_distance: torch.Tensor | None = None,
+        relative_positions: tuple[torch.Tensor, torch.Tensor] | None = None,
         conv_mask: torch.Tensor | None = None,
         cache: Cache | None = None,
         cache_offset: int = 0,
@@ -1123,7 +1138,7 @@ class Inkling2LoopFullLoopDecoderLayer(GradientCheckpointingLayer):
             key_hidden_states=self.k_input_layernorm(key_hidden_states).to(dtype),
             value_hidden_states=self.v_input_layernorm(value_hidden_states).to(dtype),
             attention_mask=attention_mask,
-            relative_distance=relative_distance,
+            relative_positions=relative_positions,
             conv_mask=conv_mask,
             cache=cache,
             cache_offset=cache_offset,
@@ -1246,10 +1261,12 @@ class Inkling2LoopNormedEmbedding(nn.Embedding):
         return self.embed_norm(super().forward(input_ids))
 
 
-def get_relative_distance(inputs_embeds: torch.Tensor, cache: Cache | None, is_sliding: bool) -> torch.Tensor:
+def get_relative_positions(
+    inputs_embeds: torch.Tensor, cache: Cache | None, is_sliding: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Distance from each query position to each key position, of shape `(query_length, key_length)`, for the full or
-    sliding attention layers. The sizes and offsets come from the same cache layer as for the attention masks.
+    Positions of the queries and of the keys, of shapes `(query_length,)` and `(key_length,)`, for the full or sliding
+    attention layers. The sizes and offsets come from the same cache layer as for the attention masks.
     """
     q_length = inputs_embeds.shape[1]
     if cache is None:
@@ -1265,7 +1282,7 @@ def get_relative_distance(inputs_embeds: torch.Tensor, cache: Cache | None, is_s
         q_offset = cache.get_query_offset(layer_idx)
     q_positions = torch.arange(q_length, device=inputs_embeds.device) + q_offset
     kv_positions = torch.arange(kv_length, device=inputs_embeds.device) + kv_offset
-    return q_positions[:, None] - kv_positions[None, :]
+    return q_positions, kv_positions
 
 
 @auto_docstring
@@ -1342,9 +1359,9 @@ class Inkling2LoopTextModel(Inkling2LoopPreTrainedModel):
                 "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
                 "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
             }
-        relative_distance_mapping = {
-            "full_attention": get_relative_distance(inputs_embeds, cache, is_sliding=False),
-            "sliding_attention": get_relative_distance(inputs_embeds, cache, is_sliding=True),
+        relative_positions_mapping = {
+            "full_attention": get_relative_positions(inputs_embeds, cache, is_sliding=False),
+            "sliding_attention": get_relative_positions(inputs_embeds, cache, is_sliding=True),
         }
 
         loop_start = self.config.loop_layer_index_start
@@ -1365,7 +1382,7 @@ class Inkling2LoopTextModel(Inkling2LoopPreTrainedModel):
                 hidden_states,
                 block_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-                relative_distance=relative_distance_mapping[decoder_layer.attention_type],
+                relative_positions=relative_positions_mapping[decoder_layer.attention_type],
                 conv_mask=causal_mask_mapping["linear_attention"],
                 cache=cache,
                 position_ids=position_ids,
@@ -1384,7 +1401,7 @@ class Inkling2LoopTextModel(Inkling2LoopPreTrainedModel):
                 hidden_states,
                 block_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-                relative_distance=relative_distance_mapping[decoder_layer.attention_type],
+                relative_positions=relative_positions_mapping[decoder_layer.attention_type],
                 conv_mask=causal_mask_mapping["linear_attention"],
                 cache=cache,
                 position_ids=position_ids,
@@ -1410,7 +1427,7 @@ class Inkling2LoopTextModel(Inkling2LoopPreTrainedModel):
                     block_states,
                     messages,
                     attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-                    relative_distance=relative_distance_mapping[decoder_layer.attention_type],
+                    relative_positions=relative_positions_mapping[decoder_layer.attention_type],
                     conv_mask=causal_mask_mapping["linear_attention"],
                     cache=cache,
                     cache_offset=cache_offset,
@@ -1429,7 +1446,7 @@ class Inkling2LoopTextModel(Inkling2LoopPreTrainedModel):
                 hidden_states,
                 block_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-                relative_distance=relative_distance_mapping[decoder_layer.attention_type],
+                relative_positions=relative_positions_mapping[decoder_layer.attention_type],
                 conv_mask=causal_mask_mapping["linear_attention"],
                 cache=cache,
                 position_ids=position_ids,
